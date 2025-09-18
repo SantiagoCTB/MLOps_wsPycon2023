@@ -1,62 +1,64 @@
 import torch
-import torchvision
 from torch.utils.data import TensorDataset
-# Testing
+from sklearn.datasets import load_diabetes
+from sklearn.model_selection import train_test_split
 import argparse
 import wandb
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--IdExecution', type=str, help='ID of the execution')
 args = parser.parse_args()
-
 if args.IdExecution:
     print(f"IdExecution: {args.IdExecution}")
 
-def load(train_size=.8):
-    """
-    # Load the data
-    """
-      
-    # the data, split between train and test sets
-    train = torchvision.datasets.MNIST(root='./data', train=True, download=True)
-    test = torchvision.datasets.MNIST(root='./data', train=False, download=True)
+def load(train_size=0.8, val_size=0.1, random_state=42):
+    data = load_diabetes()
+    X = data.data  # (n_samples, 10)
+    y = data.target  # (n_samples,)
 
-    (x_train, y_train), (x_test, y_test) = (train.data, train.targets), (test.data, test.targets)
+    # split train / temp
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y, train_size=train_size, random_state=random_state
+    )
+    # split temp into val/test
+    val_ratio = val_size / (1.0 - train_size)
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=1.0 - val_ratio, random_state=random_state
+    )
 
-    # split off a validation set for hyperparameter tuning
-    x_train, x_val = x_train[:int(len(train)*train_size)], x_train[int(len(train)*train_size):]
-    y_train, y_val = y_train[:int(len(train)*train_size)], y_train[int(len(train)*train_size):]
+    # to tensors
+    def to_tensor_ds(Xa, ya):
+        Xt = torch.tensor(Xa, dtype=torch.float32)
+        yt = torch.tensor(ya, dtype=torch.float32).unsqueeze(1)  # (n,1)
+        return TensorDataset(Xt, yt)
 
-    training_set = TensorDataset(x_train, y_train)
-    validation_set = TensorDataset(x_val, y_val)
-    test_set = TensorDataset(x_test, y_test)
-    datasets = [training_set, validation_set, test_set]
-    return datasets
+    train_ds = to_tensor_ds(X_train, y_train)
+    val_ds   = to_tensor_ds(X_val,   y_val)
+    test_ds  = to_tensor_ds(X_test,  y_test)
+
+    return (train_ds, val_ds, test_ds)
 
 def load_and_log():
-    # 🚀 start a run, with a type to label it and a project it can call home
-    with wandb.init(
-        project="MLOps-Pycon2023",
-        name=f"Load Raw Data ExecId-{args.IdExecution}", job_type="load-data") as run:
-        
-        datasets = load()  # separate code for loading the datasets
-        names = ["training", "validation", "test"]
-
-        # 🏺 create our Artifact
+    with wandb.init(project="MLOps-Pycon2023",
+                    name=f"Load Diabetes ExecId-{args.IdExecution}",
+                    job_type="load-data") as run:
         raw_data = wandb.Artifact(
-            "mnist-raw", type="dataset",
-            description="raw MNIST dataset, split into train/val/test",
-            metadata={"source": "torchvision.datasets.MNIST",
-                      "sizes": [len(dataset) for dataset in datasets]})
+            "diabetes-raw", type="dataset",
+            description="Raw Diabetes dataset (tabular)",
+            metadata={"source": "sklearn.datasets.load_diabetes"}
+        )
+
+        train_ds, val_ds, test_ds = load()
+        names = ["train", "valid", "test"]
+        datasets = [train_ds, val_ds, test_ds]
 
         for name, data in zip(names, datasets):
-            # 🐣 Store a new file in the artifact, and write something into its contents.
             with raw_data.new_file(name + ".pt", mode="wb") as file:
                 x, y = data.tensors
                 torch.save((x, y), file)
 
-        # ✍️ Save the artifact to W&B.
         run.log_artifact(raw_data)
 
-# testing
-load_and_log()
+# Ejecutar si se llama como script
+if __name__ == "__main__":
+    load_and_log()

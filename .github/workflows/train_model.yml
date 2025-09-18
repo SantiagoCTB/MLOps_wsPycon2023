@@ -27,4 +27,4 @@ jobs:
     - name: Login to WandB
       run: wandb login ${{ secrets.WANDB_API_KEY }}
     - name: Run train.py
-      run: python src/model/train.py --IdExecution ${{ github.run_number }}
+      run: python src/model/train.py --IdExecution ${{ github.run_id }}

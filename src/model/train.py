@@ -1,235 +1,164 @@
 import torch
 import torch.nn.functional as F
-from torch import nn 
-from torch.utils.data import TensorDataset
-
-# Import the model class from the main file
-from src.Classifier import Classifier
-
+from torch import nn
+from torch.utils.data import TensorDataset, DataLoader
 import os
 import argparse
 import wandb
+
+from src.model.src.Classifier import Regressor  # ajusta path
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--IdExecution', type=str, help='ID of the execution')
 args = parser.parse_args()
 
-if args.IdExecution:
-    print(f"IdExecution: {args.IdExecution}")
-else:
-    args.IdExecution = "testing console"
-
-# Device configuration
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-print("Device: ", device)
-
-
 def read(data_dir, split):
-    """
-    Read data from a directory and return a TensorDataset object.
-
-    Args:
-    - data_dir (str): The directory where the data is stored.
-    - split (str): The name of the split to read (e.g. "train", "valid", "test").
-
-    Returns:
-    - dataset (TensorDataset): A TensorDataset object containing the data.
-    """
     filename = split + ".pt"
     x, y = torch.load(os.path.join(data_dir, filename))
-
     return TensorDataset(x, y)
 
+def r2_score_torch(y_true, y_pred):
+    # y_true, y_pred: (n,1)
+    y_true_mean = torch.mean(y_true)
+    ss_tot = torch.sum((y_true - y_true_mean) ** 2)
+    ss_res = torch.sum((y_true - y_pred) ** 2)
+    return 1 - ss_res / (ss_tot + 1e-8)
 
+def train_and_log(config, experiment_id="0"):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def train(model, train_loader, valid_loader, config):
-    optimizer = getattr(torch.optim, config.optimizer)(model.parameters())
-    model.train()
-    example_ct = 0
-    for epoch in range(config.epochs):
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
-            data = data.view(data.shape[0],-1)
-            optimizer.zero_grad()
-            output = model(data)
-            loss = F.cross_entropy(output, target)
-            loss.backward()
-            optimizer.step()
+    with wandb.init(project="MLOps-Pycon2023",
+                    name=f"Train Diabetes ExecId-{experiment_id}",
+                    job_type="train-model",
+                    config=config) as run:
 
-            example_ct += len(data)
+        data_art = run.use_artifact('diabetes-preprocess:latest')
+        data_dir = data_art.download()
 
-            if batch_idx % config.batch_log_interval == 0:
-                print('Train Epoch: {} [{}/{} ({:.0%})]\tLoss: {:.6f}'.format(
-                    epoch, batch_idx * len(data), len(train_loader.dataset),
-                    batch_idx / len(train_loader), loss.item()))
-                
-                train_log(loss, example_ct, epoch)
+        train_ds = read(data_dir, "train")
+        valid_ds = read(data_dir, "valid")
 
-        # evaluate the model on the validation set at each epoch
-        loss, accuracy = test(model, valid_loader)  
-        test_log(loss, accuracy, example_ct, epoch)
+        train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True)
+        valid_loader = DataLoader(valid_ds, batch_size=config.batch_size)
 
-    
-def test(model, test_loader):
-    model.eval()
-    test_loss = 0
-    correct = 0
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
-            data = data.view(data.shape[0],-1)
-            output = model(data)
-            test_loss += F.cross_entropy(output, target, reduction='sum')  # sum up batch loss
-            pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
-            correct += pred.eq(target.view_as(pred)).sum()
+        model = Regressor(config.input_shape, config.hidden_layer_1, config.hidden_layer_2).to(device)
+        optimizer = getattr(torch.optim, config.optimizer)(model.parameters(), lr=config.lr)
+        criterion = nn.MSELoss()
 
-    test_loss /= len(test_loader.dataset)
+        example_ct = 0
+        for epoch in range(1, config.epochs + 1):
+            model.train()
+            for batch_idx, (data, target) in enumerate(train_loader):
+                data, target = data.to(device), target.to(device)  # (N,10), (N,1)
 
-    accuracy = 100. * correct / len(test_loader.dataset)
-    
-    return test_loss, accuracy
+                optimizer.zero_grad()
+                output = model(data)             # (N,1)
+                loss = criterion(output, target) # MSE
+                loss.backward()
+                optimizer.step()
 
+                example_ct += len(data)
 
-def train_log(loss, example_ct, epoch):
-    loss = float(loss)
-    # where the magic happens
-    wandb.log({"epoch": epoch, "train/loss": loss}, step=example_ct)
-    print(f"Loss after " + str(example_ct).zfill(5) + f" examples: {loss:.3f}")
-    
+                if batch_idx % config.batch_log_interval == 0:
+                    wandb.log({"train/mse": loss.item(),
+                               "epoch": epoch,
+                               "seen_examples": example_ct})
 
-def test_log(loss, accuracy, example_ct, epoch):
-    loss = float(loss)
-    accuracy = float(accuracy)
-    # where the magic happens
-    wandb.log({"epoch": epoch, "validation/loss": loss, "validation/accuracy": accuracy}, step=example_ct)
-    print(f"Loss/accuracy after " + str(example_ct).zfill(5) + f" examples: {loss:.3f}/{accuracy:.3f}")
+            # Validación
+            model.eval()
+            val_loss, val_rmse, val_r2 = 0.0, 0.0, 0.0
+            n = 0
+            with torch.no_grad():
+                for data, target in valid_loader:
+                    data, target = data.to(device), target.to(device)
+                    pred = model(data)
+                    mse = criterion(pred, target)
+                    rmse = torch.sqrt(mse)
+                    r2 = r2_score_torch(target, pred)
 
-def evaluate(model, test_loader):
-    """
-    ## Evaluate the trained model
-    """
+                    bs = data.shape[0]
+                    n += bs
+                    val_loss += mse.item() * bs
+                    val_rmse += rmse.item() * bs
+                    val_r2 += r2.item() * bs
 
-    loss, accuracy = test(model, test_loader)
-    highest_losses, hardest_examples, true_labels, predictions = get_hardest_k_examples(model, test_loader.dataset)
+            val_loss /= n
+            val_rmse /= n
+            val_r2   /= n
 
-    return loss, accuracy, highest_losses, hardest_examples, true_labels, predictions
+            wandb.log({"valid/mse": val_loss, "valid/rmse": val_rmse, "valid/r2": val_r2, "epoch": epoch})
+            print(f"Epoch {epoch}: val_mse={val_loss:.4f} | val_rmse={val_rmse:.4f} | val_r2={val_r2:.4f}")
 
-def get_hardest_k_examples(model, testing_set, k=32):
-    model.eval()
-
-    loader = DataLoader(testing_set, 1, shuffle=False)
-
-    # get the losses and predictions for each item in the dataset
-    losses = None
-    predictions = None
-    with torch.no_grad():
-        for data, target in loader:
-            data, target = data.to(device), target.to(device)
-            data = data.view(data.shape[0],-1)
-            output = model(data)
-            loss = F.cross_entropy(output, target)
-            pred = output.argmax(dim=1, keepdim=True)
-            
-            if losses is None:
-                losses = loss.view((1, 1))
-                predictions = pred
-            else:
-                losses = torch.cat((losses, loss.view((1, 1))), 0)
-                predictions = torch.cat((predictions, pred), 0)
-
-    argsort_loss = torch.argsort(losses, dim=0).cpu()
-
-    highest_k_losses = losses[argsort_loss[-k:]]
-    hardest_k_examples = testing_set[argsort_loss[-k:]][0]
-    true_labels = testing_set[argsort_loss[-k:]][1]
-    predicted_labels = predictions[argsort_loss[-k:]]
-
-    return highest_k_losses, hardest_k_examples, true_labels, predicted_labels
-
-from torch.utils.data import DataLoader
-
-def train_and_log(config,experiment_id='99'):
-    with wandb.init(
-        project="MLOps-Pycon2023", 
-        name=f"Train Model ExecId-{args.IdExecution} ExperimentId-{experiment_id}", 
-        job_type="train-model", config=config) as run:
-        config = wandb.config
-        data = run.use_artifact('mnist-preprocess:latest')
-        data_dir = data.download()
-
-        training_dataset =  read(data_dir, "training")
-        validation_dataset = read(data_dir, "validation")
-
-        train_loader = DataLoader(training_dataset, batch_size=config.batch_size)
-        validation_loader = DataLoader(validation_dataset, batch_size=config.batch_size)
-        
-        model_artifact = run.use_artifact("linear:latest")
-        model_dir = model_artifact.download()
-        model_path = os.path.join(model_dir, "initialized_model_linear.pth")
-        model_config = model_artifact.metadata
-        config.update(model_config)
-
-        model = Classifier(**model_config)
-        model.load_state_dict(torch.load(model_path))
-        model = model.to(device)
- 
-        train(model, train_loader, validation_loader, config)
-
-        model_artifact = wandb.Artifact(
-            "trained-model", type="model",
-            description="Trained NN model",
-            metadata=dict(model_config))
-
+        # Guardar modelo entrenado como artifact
+        model_art = wandb.Artifact(
+            "diabetes-model", type="model",
+            description="Trained MLP Regressor",
+            metadata=dict(config)
+        )
         torch.save(model.state_dict(), "trained_model.pth")
-        model_artifact.add_file("trained_model.pth")
+        model_art.add_file("trained_model.pth")
         wandb.save("trained_model.pth")
+        run.log_artifact(model_art)
 
-        run.log_artifact(model_artifact)
+        return model
 
-    return model
+def evaluate_and_log(experiment_id='0', config=None):
+    with wandb.init(project="MLOps-Pycon2023",
+                    name=f"Eval Diabetes ExecId-{experiment_id}",
+                    job_type="eval-model",
+                    config=config) as run:
 
-    
-def evaluate_and_log(experiment_id='99',config=None,):
-    
-    with wandb.init(project="MLOps-Pycon2023", name=f"Eval Model ExecId-{args.IdExecution} ExperimentId-{experiment_id}", job_type="eval-model", config=config) as run:
-        data = run.use_artifact('mnist-preprocess:latest')
-        data_dir = data.download()
-        testing_set = read(data_dir, "test")
+        data_art = run.use_artifact('diabetes-preprocess:latest')
+        data_dir = data_art.download()
+        test_ds = read(data_dir, "test")
+        test_loader = DataLoader(test_ds, batch_size=config.batch_size)
 
-        test_loader = torch.utils.data.DataLoader(testing_set, batch_size=128, shuffle=False)
+        # Cargar el modelo entrenado si prefieres (o re-instanciar)
+        model_art = run.use_artifact('diabetes-model:latest')
+        model_dir = model_art.download()
+        model = Regressor(config.input_shape, config.hidden_layer_1, config.hidden_layer_2)
+        model.load_state_dict(torch.load(os.path.join(model_dir, "trained_model.pth"), map_location="cpu"))
+        model.eval()
 
-        model_artifact = run.use_artifact("trained-model:latest")
-        model_dir = model_artifact.download()
-        model_path = os.path.join(model_dir, "trained_model.pth")
-        model_config = model_artifact.metadata
-
-        model = Classifier(**model_config)
-        model.load_state_dict(torch.load(model_path))
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
+        criterion = nn.MSELoss()
 
-        loss, accuracy, highest_losses, hardest_examples, true_labels, preds = evaluate(model, test_loader)
+        test_mse, test_rmse, test_r2, n = 0.0, 0.0, 0.0, 0
+        with torch.no_grad():
+            for data, target in test_loader:
+                data, target = data.to(device), target.to(device)
+                pred = model(data)
+                mse = criterion(pred, target)
+                rmse = torch.sqrt(mse)
+                r2 = r2_score_torch(target, pred)
 
-        run.summary.update({"loss": loss, "accuracy": accuracy})
+                bs = data.shape[0]
+                n += bs
+                test_mse += mse.item() * bs
+                test_rmse += rmse.item() * bs
+                test_r2 += r2.item() * bs
 
-        wandb.log({"high-loss-examples":
-            [wandb.Image(hard_example, caption=str(int(pred)) + "," +  str(int(label)))
-             for hard_example, pred, label in zip(hardest_examples, preds, true_labels)]})
+        test_mse /= n
+        test_rmse /= n
+        test_r2   /= n
 
-epochs = [50,100,200]
-for id,epoch in enumerate(epochs):
-    train_config = {"batch_size": 128,
-                "epochs": epoch,
-                "batch_log_interval": 25,
-                "optimizer": "Adam"}
-    model = train_and_log(train_config,id)
-    evaluate_and_log(id)        
+        wandb.log({"test/mse": test_mse, "test/rmse": test_rmse, "test/r2": test_r2})
+        print(f"TEST: mse={test_mse:.4f} | rmse={test_rmse:.4f} | r2={test_r2:.4f}")
 
-"""    
-train_config = {"batch_size": 128,
-                "epochs": 5,
-                "batch_log_interval": 25,
-                "optimizer": "Adam"}
-
-model = train_and_log(train_config)
-evaluate_and_log()
-"""
+if __name__ == "__main__":
+    # ejemplo de config
+    train_config = {
+        "input_shape": 10,
+        "hidden_layer_1": 64,
+        "hidden_layer_2": 64,
+        "batch_size": 64,
+        "epochs": 50,
+        "batch_log_interval": 10,
+        "optimizer": "Adam",
+        "lr": 1e-3
+    }
+    # ENTRENAR
+    train_and_log(train_config, experiment_id=args.IdExecution or "local")
+    # EVALUAR
+    evaluate_and_log(experiment_id=args.IdExecution or "local", config=train_config)
