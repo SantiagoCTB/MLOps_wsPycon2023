@@ -5,8 +5,7 @@ from torch.utils.data import TensorDataset, DataLoader
 import os
 import argparse
 import wandb
-
-from src.model.src.Classifier import Regressor  # ajusta path
+from src.Classifier import Regressor
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--IdExecution', type=str, help='ID of the execution')
