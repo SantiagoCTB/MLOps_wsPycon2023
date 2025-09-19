@@ -4,7 +4,7 @@ import argparse
 import wandb
 
 # Ojo con el import: si renombraste a Regressor:
-from src.model.src.Classifier import Regressor  # ajusta el path real
+from src.Classifier import Regressor
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--IdExecution', type=str, help='ID of the execution')
