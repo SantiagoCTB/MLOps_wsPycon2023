@@ -23,42 +23,45 @@ def r2_score_torch(y_true, y_pred):
     ss_res = torch.sum((y_true - y_pred) ** 2)
     return 1 - ss_res / (ss_tot + 1e-8)
 
+# ... imports arriba ...
+from torch.utils.data import TensorDataset, DataLoader
+# (mantén el resto de imports como los tienes)
+
 def train_and_log(config, experiment_id="0"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     with wandb.init(project="MLOps-Pycon2023",
                     name=f"Train Diabetes ExecId-{experiment_id}",
                     job_type="train-model",
-                    config=config) as run:
-
+                    config=config) as run:  # <- OK pasar dict
         data_art = run.use_artifact('diabetes-preprocess:latest')
         data_dir = data_art.download()
 
         train_ds = read(data_dir, "train")
         valid_ds = read(data_dir, "valid")
 
-        train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True)
-        valid_loader = DataLoader(valid_ds, batch_size=config.batch_size)
+        train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True)
+        valid_loader = DataLoader(valid_ds, batch_size=config["batch_size"])
 
-        model = Regressor(config.input_shape, config.hidden_layer_1, config.hidden_layer_2).to(device)
-        optimizer = getattr(torch.optim, config.optimizer)(model.parameters(), lr=config.lr)
+        model = Regressor(config["input_shape"], config["hidden_layer_1"], config["hidden_layer_2"]).to(device)
+        optimizer = getattr(torch.optim, config["optimizer"])(model.parameters(), lr=config["lr"])
         criterion = nn.MSELoss()
 
         example_ct = 0
-        for epoch in range(1, config.epochs + 1):
+        for epoch in range(1, config["epochs"] + 1):
             model.train()
             for batch_idx, (data, target) in enumerate(train_loader):
-                data, target = data.to(device), target.to(device)  # (N,10), (N,1)
+                data, target = data.to(device), target.to(device)
 
                 optimizer.zero_grad()
-                output = model(data)             # (N,1)
-                loss = criterion(output, target) # MSE
+                output = model(data)
+                loss = criterion(output, target)
                 loss.backward()
                 optimizer.step()
 
                 example_ct += len(data)
 
-                if batch_idx % config.batch_log_interval == 0:
+                if batch_idx % config["batch_log_interval"] == 0:
                     wandb.log({"train/mse": loss.item(),
                                "epoch": epoch,
                                "seen_examples": example_ct})
@@ -101,6 +104,7 @@ def train_and_log(config, experiment_id="0"):
 
         return model
 
+
 def evaluate_and_log(experiment_id='0', config=None):
     with wandb.init(project="MLOps-Pycon2023",
                     name=f"Eval Diabetes ExecId-{experiment_id}",
@@ -110,12 +114,11 @@ def evaluate_and_log(experiment_id='0', config=None):
         data_art = run.use_artifact('diabetes-preprocess:latest')
         data_dir = data_art.download()
         test_ds = read(data_dir, "test")
-        test_loader = DataLoader(test_ds, batch_size=config.batch_size)
+        test_loader = DataLoader(test_ds, batch_size=config["batch_size"])
 
-        # Cargar el modelo entrenado si prefieres (o re-instanciar)
         model_art = run.use_artifact('diabetes-model:latest')
         model_dir = model_art.download()
-        model = Regressor(config.input_shape, config.hidden_layer_1, config.hidden_layer_2)
+        model = Regressor(config["input_shape"], config["hidden_layer_1"], config["hidden_layer_2"])
         model.load_state_dict(torch.load(os.path.join(model_dir, "trained_model.pth"), map_location="cpu"))
         model.eval()
 
